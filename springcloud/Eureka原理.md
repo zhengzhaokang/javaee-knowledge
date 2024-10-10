@@ -89,6 +89,9 @@ Eureka服务端提供一个接口，用来接收客户端服务注册的请求�
 
 Eureka的注册表是一个双字典结构的数据，服务发现的目的是标识服务和服务状态的管理，所以注册表中有服务标识、服务基本信息、服务状态信息等
 
+第一层Map的key：是服务名。这一层主要用于区分不同的服务，即根据服务名可以快速找到对应的服务元数据集合。
+第二层Map的key：是具体服务的实例名。这一层进一步细化了服务下的不同实例，通常这个实例名会包含应用名称和端口号，形如“applicationName-port”，以确保每个服务实例都是唯一的，并且可以被准确地识别和调用。
+
 ConcurrentHashMap<String, Map<String, Lease<InstanceInfo>>> registry = new ConcurrentHashMap();
 ```
 

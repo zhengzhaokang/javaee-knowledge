@@ -291,7 +291,9 @@ public class HelloController {
 }
 ```
 
-##### 5.1 当实例化LoadBalancerAutoConfiguration时，给所有标记了@LoadBalanced的RestTemplate Bean设置了拦截器LoadBalancerInterceptor，此实例保存在了RestTemplate的父类InterceptingHttpAccessor的集合List interceptors中。
+##### 5.1 当实例化LoadBalancerAutoConfiguration时，
+
+给所有标记了@LoadBalanced的RestTemplate Bean设置了拦截器LoadBalancerInterceptor，此实例保存在了RestTemplate的父类InterceptingHttpAccessor的集合List interceptors中。
 
 设置拦截器LoadBalancerInterceptor源码如下：
 
@@ -353,5 +355,659 @@ public class LoadBalancerAutoConfiguration {
     }
     // 略
 }
+```
+
+##### 5.2 LoadBalancerClientLoadBalancerRequestFactory
+
+从上面源码可以看出LoadBalancerInterceptor的构造函数接受两个参数：LoadBalancerClientLoadBalancerRequestFactory.
+
+LoadBalancerRequestFactory的实例在此Configuration中被注入类，而LoadBalancerClient的实例却没有。那么LoadBalancerClient的实例是在哪里实例化的呢？答案是RibbonAutoConfiguration，这个Configuration注入了LoadBalancerClient的实现类RibbonLoadBalancerClient的实例和SpringClientFactory的实例，相关源码如下：
+
+```
+@Bean
+public SpringClientFactory springClientFactory() {
+    SpringClientFactory factory = new SpringClientFactory();
+    factory.setConfigurations(this.configurations);
+    return factory;
+}
+
+@Bean
+@ConditionalOnMissingBean(LoadBalancerClient.class)
+public LoadBalancerClient loadBalancerClient() {
+    return new RibbonLoadBalancerClient(springClientFactory());
+}
+
+```
+
+##### 5.3 LoadBalancerInterceptor
+
+至此拦截器LoadBalancerInterceptor创建完成并且保存在了RestTemplate的集合属性中，那么RestTemplate是如何利用此拦截器的呢？
+
+当我们使用RestTemplate发起请求时最终会调用到RestTemplate的doExecute()方法，此方法会创建ClientHttpRequest对象并调用其execute()方法发起请求，源码如下：
+
+```
+protected <T> T doExecute(URI url, @Nullable HttpMethod method, @Nullable RequestCallback requestCallback,
+        @Nullable ResponseExtractor<T> responseExtractor) throws RestClientException {
+
+    ClientHttpResponse response = null;
+    try {
+        // 1. 创建ClientHttpRequest。
+        ClientHttpRequest request = createRequest(url, method);
+        if (requestCallback != null) {
+            requestCallback.doWithRequest(request);
+        }
+        // 2. 执行其execute()方法获取结果。
+        response = request.execute();
+        handleResponse(url, method, response);
+        return (responseExtractor != null ? responseExtractor.extractData(response) : null);
+    }
+    catch (IOException ex) {
+        String resource = url.toString();
+        String query = url.getRawQuery();
+        resource = (query != null ? resource.substring(0, resource.indexOf('?')) : resource);
+        throw new ResourceAccessException("I/O error on " + method.name() +
+                " request for \"" + resource + "\": " + ex.getMessage(), ex);
+    }
+    finally {
+        if (response != null) {
+            response.close();
+        }
+    }
+}
+
+protected ClientHttpRequest createRequest(URI url, HttpMethod method) throws IOException {
+    ClientHttpRequest request = getRequestFactory().createRequest(url, method);
+    if (logger.isDebugEnabled()) {
+        logger.debug("HTTP " + method.name() + " " + url);
+    }
+    return request;
+}
+
+@Override
+public ClientHttpRequestFactory getRequestFactory() {
+    List<ClientHttpRequestInterceptor> interceptors = getInterceptors();
+    if (!CollectionUtils.isEmpty(interceptors)) {
+        ClientHttpRequestFactory factory = this.interceptingRequestFactory;
+        if (factory == null) {
+            factory = new InterceptingClientHttpRequestFactory(super.getRequestFactory(), interceptors);
+            this.interceptingRequestFactory = factory;
+        }
+        return factory;
+    }
+    else {
+        return super.getRequestFactory();
+    }
+}
+
+```
+
+##### 5.4 InterceptingClientHttpRequestFactory
+
+从上面的getRequestFactory()方法可以看到当集合interceptors不为空的时候ClientHttpRequest对象是由类InterceptingClientHttpRequestFactory的createRequest()方法创建出来的，并且集合interceptors作为参数传递到了InterceptingClientHttpRequestFactory中，深入InterceptingClientHttpRequestFactory的createRequest()方法，如下：
+
+```
+public class InterceptingClientHttpRequestFactory extends AbstractClientHttpRequestFactoryWrapper {
+
+    private final List<ClientHttpRequestInterceptor> interceptors;
+
+    public InterceptingClientHttpRequestFactory(ClientHttpRequestFactory requestFactory,
+            @Nullable List<ClientHttpRequestInterceptor> interceptors) {
+
+        super(requestFactory);
+        this.interceptors = (interceptors != null ? interceptors : Collections.emptyList());
+    }
+
+    @Override
+    protected ClientHttpRequest createRequest(URI uri, HttpMethod httpMethod, ClientHttpRequestFactory requestFactory) {
+        // 直接返回InterceptingClientHttpRequest对象。
+        return new InterceptingClientHttpRequest(requestFactory, this.interceptors, uri, httpMethod);
+    }
+
+}
+
+```
+
+##### 5.5 InterceptingClientHttpRequest
+
+可以看到拦截器最终传递到了InterceptingClientHttpRequest中
+
+上面说了RestTemplate的doExecute()方法创建了InterceptingClientHttpRequest对象且调用了其execute()方法获取响应结果，深入其execute()方法发现在execute()中直接调用了拦截器的intercept()方法，也即InterceptingClientHttpRequest的intercept()方法，源码如下：
+
+```
+public ClientHttpResponse execute(HttpRequest request, byte[] body) throws IOException {
+    if (this.iterator.hasNext()) {
+        ClientHttpRequestInterceptor nextInterceptor = this.iterator.next();
+        // 这里调用InterceptingClientHttpRequest的intercept()方法
+        return nextInterceptor.intercept(request, body, this);
+    }
+    // 略
+}
+
+```
+
+也就是说RestTemplate的请求最终是委托给InterceptingClientHttpRequest来处理。那么InterceptingClientHttpRequest是如何利用Ribbon相关接口处理请求的呢？且看InterceptingClientHttpRequest的intercept()方法：
+
+```
+public class LoadBalancerInterceptor implements ClientHttpRequestInterceptor {
+
+    private LoadBalancerClient loadBalancer;
+    private LoadBalancerRequestFactory requestFactory;
+
+    public LoadBalancerInterceptor(LoadBalancerClient loadBalancer, LoadBalancerRequestFactory requestFactory) {
+        this.loadBalancer = loadBalancer;
+        this.requestFactory = requestFactory;
+    }
+
+    public LoadBalancerInterceptor(LoadBalancerClient loadBalancer) {
+        // for backwards compatibility
+        this(loadBalancer, new LoadBalancerRequestFactory(loadBalancer));
+    }
+
+    @Override
+    public ClientHttpResponse intercept(final HttpRequest request, final byte[] body,
+            final ClientHttpRequestExecution execution) throws IOException {
+        final URI originalUri = request.getURI();
+        String serviceName = originalUri.getHost();
+        // 直接调用LoadBalancerClient的execute()方法。
+        return this.loadBalancer.execute(serviceName, requestFactory.createRequest(request, body, execution));
+    }
+}
+```
+
+可以看到InterceptingClientHttpRequest的intercept()方法直接调用LoadBalancerClient的execute()方法，LoadBalancerClient是一个接口，这里其实现类为RibbonLoadBalancerClient，上面创建InterceptingClientHttpRequest时提到LoadBalancerAutoConfiguration注入了RibbonLoadBalancerClient Bean，此Bean通过构造函数保存在了LoadBalancerClient中。那么接下来就是LoadBalancerClient的execute()方法了.
+
+##### 5.6 LoadBalancerClient的execute()方法
+
+```
+LoadBalancerClient的execute()方法首先会通过调用SpringClientFactory的getLoadBalancer()方法获取ILoadBalancer，那么此方法是如何返回ILoadBalancer呢？很简单，就是从Spring上下文中获取，那么Spring上下文中的ILoadBalancer时何时注入的呢？答案是RibbonClientConfiguration，此Configuration向Spring上下文注入了以下Bean：
+
+ILoadBalancer的实现类ZoneAwareLoadBalancer。
+IRule的实现类ZoneAvoidanceRule。
+IClientConfig的实现类DefaultClientConfigImpl。
+
+另外EurekaRibbonClientConfiguration还注入了：
+ServerList的实现类DomainExtractingServerList和DiscoveryEnabledNIWSServerList。
+IPing的实现类NIWSDiscoveryPing。
+```
+
+源码如下:
+
+```
+@Bean
+@ConditionalOnMissingBean
+public IClientConfig ribbonClientConfig() {
+    DefaultClientConfigImpl config = new DefaultClientConfigImpl();
+    config.loadProperties(this.name);
+    config.set(CommonClientConfigKey.ConnectTimeout, DEFAULT_CONNECT_TIMEOUT);
+    config.set(CommonClientConfigKey.ReadTimeout, DEFAULT_READ_TIMEOUT);
+    config.set(CommonClientConfigKey.GZipPayload, DEFAULT_GZIP_PAYLOAD);
+    return config;
+}
+
+@Bean
+@ConditionalOnMissingBean
+public IRule ribbonRule(IClientConfig config) {
+    if (this.propertiesFactory.isSet(IRule.class, name)) {
+        return this.propertiesFactory.get(IRule.class, config, name);
+    }
+    ZoneAvoidanceRule rule = new ZoneAvoidanceRule();
+    rule.initWithNiwsConfig(config);
+    return rule;
+}
+
+@Bean
+@ConditionalOnMissingBean
+public ServerList<Server> ribbonServerList(IClientConfig config) {
+    if (this.propertiesFactory.isSet(ServerList.class, name)) {
+        return this.propertiesFactory.get(ServerList.class, config, name);
+    }
+    ConfigurationBasedServerList serverList = new ConfigurationBasedServerList();
+    serverList.initWithNiwsConfig(config);
+    return serverList;
+}
+
+@Bean
+@ConditionalOnMissingBean
+public ILoadBalancer ribbonLoadBalancer(IClientConfig config,
+        ServerList<Server> serverList, ServerListFilter<Server> serverListFilter,
+        IRule rule, IPing ping, ServerListUpdater serverListUpdater) {
+    if (this.propertiesFactory.isSet(ILoadBalancer.class, name)) {
+        return this.propertiesFactory.get(ILoadBalancer.class, config, name);
+    }
+    return new ZoneAwareLoadBalancer<>(config, rule, ping, serverList,
+            serverListFilter, serverListUpdater);
+}
+
+@Bean
+@ConditionalOnMissingBean
+public IPing ribbonPing(IClientConfig config) {
+    if (this.propertiesFactory.isSet(IPing.class, serviceId)) {
+        return this.propertiesFactory.get(IPing.class, config, serviceId);
+    }
+    NIWSDiscoveryPing ping = new NIWSDiscoveryPing();
+    ping.initWithNiwsConfig(config);
+    return ping;
+}
+
+@Bean
+@ConditionalOnMissingBean
+public ServerList<?> ribbonServerList(IClientConfig config, Provider<EurekaClient> eurekaClientProvider) {
+    if (this.propertiesFactory.isSet(ServerList.class, serviceId)) {
+        return this.propertiesFactory.get(ServerList.class, config, serviceId);
+    }
+    DiscoveryEnabledNIWSServerList discoveryServerList = new DiscoveryEnabledNIWSServerList(
+            config, eurekaClientProvider);
+    DomainExtractingServerList serverList = new DomainExtractingServerList(
+            discoveryServerList, config, this.approximateZoneFromHostname);
+    return serverList;
+}
+
+```
+
+##### 5.7  ZoneAwareLoadBalancer
+
+ZoneAwareLoadBalancer的构造函数通过调用DiscoveryEnabledNIWSServerList的getUpdatedListOfServers()方法获取Server集合
+
+DiscoveryEnabledNIWSServerList维护了一个Provider类型的属性eurekaClientProvider，eurekaClientProvider缓存了EurekaClient的实现类CloudEurekaClient的实例，getUpdatedListOfServers()方法通过调用CloudEurekaClient的getInstancesByVipAddress()方法从Eureka Client缓存中获取应用对应的所有InstanceInfo列表。源码如下：
+
+```
+// 缓存了EurekaClient的实现类CloudEurekaClient的实例
+private final Provider<EurekaClient> eurekaClientProvider;
+
+@Override
+public List<DiscoveryEnabledServer> getUpdatedListOfServers(){
+    return obtainServersViaDiscovery();
+}
+
+private List<DiscoveryEnabledServer> obtainServersViaDiscovery() {
+    List<DiscoveryEnabledServer> serverList = new ArrayList<DiscoveryEnabledServer>();
+
+    if (eurekaClientProvider == null || eurekaClientProvider.get() == null) {
+        logger.warn("EurekaClient has not been initialized yet, returning an empty list");
+        return new ArrayList<DiscoveryEnabledServer>();
+    }
+
+    EurekaClient eurekaClient = eurekaClientProvider.get();
+    if (vipAddresses!=null){
+        for (String vipAddress : vipAddresses.split(",")) {
+            // if targetRegion is null, it will be interpreted as the same region of client
+            List<InstanceInfo> listOfInstanceInfo = eurekaClient.getInstancesByVipAddress(vipAddress, isSecure, targetRegion);
+            for (InstanceInfo ii : listOfInstanceInfo) {
+                if (ii.getStatus().equals(InstanceStatus.UP)) {
+
+                    if(shouldUseOverridePort){
+                        if(logger.isDebugEnabled()){
+                            logger.debug("Overriding port on client name: " + clientName + " to " + overridePort);
+                        }
+
+                        InstanceInfo copy = new InstanceInfo(ii);
+
+                        if(isSecure){
+                            ii = new InstanceInfo.Builder(copy).setSecurePort(overridePort).build();
+                        }else{
+                            ii = new InstanceInfo.Builder(copy).setPort(overridePort).build();
+                        }
+                    }
+
+                    DiscoveryEnabledServer des = createServer(ii, isSecure, shouldUseIpAddr);
+                    serverList.add(des);
+                }
+            }
+            if (serverList.size()>0 && prioritizeVipAddressBasedServers){
+                break; // if the current vipAddress has servers, we dont use subsequent vipAddress based servers
+            }
+        }
+    }
+    return serverList;
+}
+```
+
+LoadBalancerClient的execute()方法在通过调用SpringClientFactory的getLoadBalancer()方法获取ILoadBalancer后调用其chooseServer()返回一个Server对象，如下：
+
+```
+public <T> T execute(String serviceId, LoadBalancerRequest<T> request, Object hint) throws IOException {
+    // 1. 获取ILoadBalancer
+    ILoadBalancer loadBalancer = getLoadBalancer(serviceId);
+    
+    // 2. 通过ILoadBalancer选择一个Server
+    Server server = getServer(loadBalancer, hint);
+    if (server == null) {
+        throw new IllegalStateException("No instances available for " + serviceId);
+    }
+    RibbonServer ribbonServer = new RibbonServer(serviceId, server, isSecure(server,
+            serviceId), serverIntrospector(serviceId).getMetadata(server));
+
+    // 3. 对Server发起请求
+    return execute(serviceId, ribbonServer, request);
+}
+
+protected Server getServer(ILoadBalancer loadBalancer, Object hint) {
+    if (loadBalancer == null) {
+        return null;
+    }
+    // Use 'default' on a null hint, or just pass it on?
+    return loadBalancer.chooseServer(hint != null ? hint : "default");
+}
+
+```
+
+##### 5.8  ZoneAwareLoadBalancer的chooseServer
+
+ZoneAwareLoadBalancer的chooseServer()方法会通过调用ZoneAvoidanceRule的choose()方法返回一个Server
+
+ZoneAvoidanceRule继承类ClientConfigEnabledRoundRobinRule，所以其会根据ZoneAwareLoadBalancer获取的Server列表采用轮询的负载均衡策略选择一个Server返回；最后根据此Server的地址等向其发起请求.
+
+
+
+#### 6、Feign接口
+
+##### 6.1 Feign基本使用
+
+相对于RestTemplate+@Loadbalance的方式，我们在使用Spring Cloud的时候使用更多的是Feign接口，因为Feign接口使用起来会更加简单，下面就是一个使用Feign接口调用服务的例子：
+
+```
+// 定义Feign接口
+@FeignClient(value = "Eureka-Producer", fallbackFactory = HelloClientFallbackFactory.class)
+public interface HelloClient {
+
+    @GetMapping("/hello")
+    String hello();
+}
+
+// 订单熔断快速失败回调
+@Component
+public class HelloClientFallbackFactory implements FallbackFactory<HelloClient>, HelloClient {
+
+    @Override
+    public HelloClient create(Throwable throwable) {
+        return this;
+    }
+
+    @Override
+    public String hello() {
+        return "熔断";
+    }
+}
+
+// 使用
+@RestController
+public class HelloController {
+
+    @Resource
+    private HelloClient helloClient;
+
+    @GetMapping("/hello")
+    public String hello() {
+        return helloClient.hello();
+    }
+}
+
+```
+
+##### 6.2 执行请求时机 LoadBalancerFeignClient
+
+与RestTemplate的通过RibbonLoadBalancerClient获取Server并执行请求类似，
+
+Feign接口通过LoadBalancerFeignClient获取Server并执行请求。DefaultFeignLoadBalancedConfiguration会注入LoadBalancerFeignClient Bean，源码如下：
+
+```
+@Configuration
+class DefaultFeignLoadBalancedConfiguration {
+    @Bean
+    @ConditionalOnMissingBean
+    public Client feignClient(CachingSpringLoadBalancerFactory cachingFactory,
+                              SpringClientFactory clientFactory) {
+        return new LoadBalancerFeignClient(new Client.Default(null, null),
+                cachingFactory, clientFactory);
+    }
+}
+```
+
+##### 6.3 如何利用Ribbon做负载均衡
+
+那么LoadBalancerFeignClient的execute()方法又是如何利用Ribbon做负载均衡的呢？其通过调用CachingSpringLoadBalancerFactory的create()方法获取FeignLoadBalancer对象，FeignLoadBalancer对象持有一个ILoadBalancer的对象实例，此ILoadBalancer对象实例是CachingSpringLoadBalancerFactory通过调用SpringClientFactory的getLoadBalancer()方法从Spring上下文中获取的，源码如下：
+
+```
+public class CachingSpringLoadBalancerFactory {
+
+	protected final SpringClientFactory factory;
+
+	protected LoadBalancedRetryFactory loadBalancedRetryFactory = null;
+
+	private volatile Map<String, FeignLoadBalancer> cache = new ConcurrentReferenceHashMap<>();
+
+	public CachingSpringLoadBalancerFactory(SpringClientFactory factory) {
+		this.factory = factory;
+	}
+
+	public CachingSpringLoadBalancerFactory(SpringClientFactory factory,
+			LoadBalancedRetryFactory loadBalancedRetryPolicyFactory) {
+		this.factory = factory;
+		this.loadBalancedRetryFactory = loadBalancedRetryPolicyFactory;
+	}
+
+	public FeignLoadBalancer create(String clientName) {
+		FeignLoadBalancer client = this.cache.get(clientName);
+		if (client != null) {
+			return client;
+		}
+		IClientConfig config = this.factory.getClientConfig(clientName);
+		ILoadBalancer lb = this.factory.getLoadBalancer(clientName);
+		ServerIntrospector serverIntrospector = this.factory.getInstance(clientName,
+				ServerIntrospector.class);
+		client = this.loadBalancedRetryFactory != null
+				? new RetryableFeignLoadBalancer(lb, config, serverIntrospector,
+						this.loadBalancedRetryFactory)
+				: new FeignLoadBalancer(lb, config, serverIntrospector);
+		this.cache.put(clientName, client);
+		return client;
+	}
+
+}
+```
+
+##### 6.4 AbstractLoadBalancerAwareClient 执行executeWithLoadBalancer
+
+FeignLoadBalancer 父类 AbstractLoadBalancerAwareClient 执行executeWithLoadBalancer,
+
+创建完FeignLoadBalancer后紧接着接着调用了LoadBalancerFeignClient的executeWithLoadBalancer()方法，如下:
+
+```
+@Override
+public Response execute(Request request, Request.Options options) throws IOException {
+    URI asUri = URI.create(request.url());
+    String clientName = asUri.getHost();
+    URI uriWithoutHost = cleanUrl(request.url(), clientName);
+    FeignLoadBalancer.RibbonRequest ribbonRequest = new FeignLoadBalancer.RibbonRequest(
+            this.delegate, request, uriWithoutHost);
+
+    IClientConfig requestConfig = getClientConfig(options, clientName);
+    // 执行FeignLoadBalancer的executeWithLoadBalancer()方法。
+    return lbClient(clientName).executeWithLoadBalancer(ribbonRequest,
+            requestConfig).toResponse();
+    // 略
+}
+// 创建FeignLoadBalancer对象并返回
+private FeignLoadBalancer lbClient(String clientName) {
+    return this.lbClientFactory.create(clientName);
+}
+```
+
+executeWithLoadBalancer()方法的具体实现在类FeignLoadBalancer的父类AbstractLoadBalancerAwareClient中，如下：
+
+```
+public T executeWithLoadBalancer(final S request, final IClientConfig requestConfig) throws ClientException {
+    LoadBalancerCommand<T> command = buildLoadBalancerCommand(request, requestConfig);
+
+    try {
+        return command.submit(
+            new ServerOperation<T>() {
+                @Override
+                public Observable<T> call(Server server) {
+                    URI finalUri = reconstructURIWithServer(server, request.getUri());
+                    S requestForServer = (S) request.replaceUri(finalUri);
+                    try {
+                        return Observable.just(AbstractLoadBalancerAwareClient.this.execute(requestForServer, requestConfig));
+                    } 
+                    catch (Exception e) {
+                        return Observable.error(e);
+                    }
+                }
+            })
+            .toBlocking()
+            .single();
+    } catch (Exception e) {
+        // 略
+    }
+}
+```
+
+##### 6.5 LoadBalancerCommand 的 submit方法
+
+executeWithLoadBalancer()方法创建了LoadBalancerCommand对象并且向提交(submit()方法)了一个ServerOperation对象，跟踪LoadBalancerCommand的submit()方法发现其调用了selectServer()方法获取Server，而selectServer()方法则委托给了FeignLoadBalancer的父类LoadBalancerContext的getServerFromLoadBalancer()方法获取Server，如下：
+
+```
+public T executeWithLoadBalancer(final S request, final IClientConfig requestConfig) throws ClientException {
+    LoadBalancerCommand<T> command = buildLoadBalancerCommand(request, requestConfig);
+
+    try {
+        return command.submit(
+            new ServerOperation<T>() {
+                @Override
+                public Observable<T> call(Server server) {
+                    URI finalUri = reconstructURIWithServer(server, request.getUri());
+                    S requestForServer = (S) request.replaceUri(finalUri);
+                    try {
+                        return Observable.just(AbstractLoadBalancerAwareClient.this.execute(requestForServer, requestConfig));
+                    } 
+                    catch (Exception e) {
+                        return Observable.error(e);
+                    }
+                }
+            })
+            .toBlocking()
+            .single();
+    } catch (Exception e) {
+        Throwable t = e.getCause();
+        if (t instanceof ClientException) {
+            throw (ClientException) t;
+        } else {
+            throw new ClientException(e);
+        }
+    }
+    
+}
+
+public Observable<T> submit(final ServerOperation<T> operation) {
+        final ExecutionInfoContext context = new ExecutionInfoContext();
+    // 略
+    
+    // 这里当server为null时调用selectServer()获取Server。
+    Observable<T> o = 
+            (server == null ? selectServer() : Observable.just(server))
+            .concatMap(new Func1<Server, Observable<T>>() {
+                @Override
+                // Called for each server being selected
+                public Observable<T> call(Server server) {
+                    context.setServer(server);
+                    final ServerStats stats = loadBalancerContext.getServerStats(server);
+                    
+                    // Called for each attempt and retry
+                    Observable<T> o = Observable
+                            .just(server)
+                            .concatMap(new Func1<Server, Observable<T>>() {
+                                @Override
+                                public Observable<T> call(final Server server) {
+                                    // 略
+                }
+            });
+        // 略
+}
+
+private Observable<Server> selectServer() {
+    return Observable.create(new OnSubscribe<Server>() {
+        @Override
+        public void call(Subscriber<? super Server> next) {
+            try {
+                // 调用LoadBalancerContext的getServerFromLoadBalancer()获取Server
+                Server server = loadBalancerContext.getServerFromLoadBalancer(loadBalancerURI, loadBalancerKey);   
+                next.onNext(server);
+                next.onCompleted();
+            } catch (Exception e) {
+                next.onError(e);
+            }
+        }
+    });
+}
+```
+
+##### 6.6 LoadBalancerContext的getServerFromLoadBalancer()方法
+
+FeignLoadBalancer和LoadBalancerCommand互相依赖、彼此调用，最终FeignLoadBalancer的父类LoadBalancerContext的getServerFromLoadBalancer()方法返回了Server，此方法通过调用其持有的ILoadBalancer对象的chooseServer()方法获取Server，源码如下：
+
+```
+public Server getServerFromLoadBalancer(@Nullable URI original, @Nullable Object loadBalancerKey) throws ClientException {
+        String host = null;
+    int port = -1;
+    if (original != null) {
+        host = original.getHost();
+    }
+    if (original != null) {
+        Pair<String, Integer> schemeAndPort = deriveSchemeAndPortFromPartialUri(original);        
+        port = schemeAndPort.second();
+    }
+    // 获取ILoadBalancer
+    ILoadBalancer lb = getLoadBalancer();
+    // 调用ILoadBalancer的chooseServer()方法获取Server。
+    Server svc = lb.chooseServer(loadBalancerKey);
+    if (svc == null){
+        throw new ClientException(ClientException.ErrorType.GENERAL,
+                "Load balancer does not have available server for client: "
+                        + clientName);
+    }
+    host = svc.getHost();
+    if (host == null){
+        throw new ClientException(ClientException.ErrorType.GENERAL,
+                "Invalid Server for :" + svc);
+    }
+    logger.debug("{} using LB returned Server: {} for request {}", new Object[]{clientName, svc, original});
+    return svc;
+}
+```
+
+#### 7、总结
+
+##### 7.1 ILoadBalancer、IRule、IPing
+
+```
+Ribbon通过ILoadBalancer接口提供负载均衡服务，其实现原理为：
+ILoadBalancer依赖ServerList通过DiscoveryClient从Eureka Client处获取Server列表并缓存这些Server列表。
+IRule接口是负载均衡策略的抽象，ILoadBalancer通过IRule选出一个Server。
+IPing接口定时对ILoadBalancer缓存的Server列表进行检测，判断其是否可用。
+
+当使用RestTemplate+@LoadBalanced的方式进行服务调用时，LoadBalancerInterceptor和RibbonLoadBalancerClient作为桥梁结合Ribbon提供负载均衡服务。
+当使用Feign接口调用服务时，LoadBalancerFeignClient和FeignLoadBalancer作为调用Ribbon的入口为Feign接口提供负载均衡服务。
+不管使用那种姿势，最终都会通过Ribbon的ILoadBalancer接口实现负载均衡。
+```
+
+##### 7.2 Ribbon相关Configuration以及注入的Bean
+
+```
+RibbonAutoConfiguration
+注入了 LoadBalancerClient的实现类RibbonLoadBalancerClient。
+注入了SpringClientFactory。
+
+LoadBalancerAutoConfiguration
+注入了LoadBalancerInterceptor。
+给RestTemplate设置LoadBalancerInterceptor。
+
+RibbonClientConfiguration
+注入了ILoadBalancer的实现类ZoneAwareLoadBalancer。
+注入了IRule的实现类ZoneAvoidanceRule。
+注入了IClientConfig的实现类DefaultClientConfigImpl。
+
+EurekaRibbonClientConfiguration
+注入了IPing的实现类NIWSDiscoveryPing。
+注入了ServerList的实现类DiscoveryEnabledNIWSServerList。
 ```
 
